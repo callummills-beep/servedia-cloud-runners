@@ -62,6 +62,8 @@ def supabase_sql(sql, supabase_pat):
     headers = {
         "Authorization": f"Bearer {supabase_pat}",
         "Content-Type": "application/json",
+        "User-Agent": "servedia-openclaw-payment-pull/1.0",
+        "Accept": "application/json",
     }
     req = urllib.request.Request(url, data=json.dumps({"query": sql}).encode(), headers=headers, method="POST")
     try:
