@@ -35,16 +35,40 @@ ONB = "https://api-onboard.windsor.ai"
 UA = "servedia-windsor-sync-api/1.0"
 ACTIVE = ("Active (First Contract)","Active (Past Initial Contract)","Paused")
 CHURNED = ("Churned",)
+SLACK_CHANNEL = "C0ACZS07GJG"   # #automations (Servedia | Internal)
 
 def secrets():
     import os
     if b64 := os.environ.get("SECRETS_B64"):
-        import base64; return json.loads(base64.b64decode(b64))
+        import base64; d = json.loads(base64.b64decode(b64)); d.setdefault("slack_token", None); return d
+    def rd(p):
+        try: return (CONFIG/p).read_text().strip()
+        except Exception: return None
     return {
         "windsor_keys":[(CONFIG/"windsor-api-key-1").read_text().strip(),
                         (CONFIG/"windsor-api-key-2").read_text().strip()],
         "supabase_svc":(CONFIG/"supabase-hub-service-role-key").read_text().strip(),
+        "slack_token": rd("slack-internal-bot-token"),
     }
+
+def slack_post(token, text):
+    if not token: return
+    try:
+        import urllib.request as u
+        req=u.Request("https://slack.com/api/chat.postMessage",
+            data=json.dumps({"channel":SLACK_CHANNEL,"text":text}).encode(),
+            headers={"Authorization":f"Bearer {token}","Content-Type":"application/json"}, method="POST")
+        u.urlopen(req, timeout=20).read()
+    except Exception as e:
+        print(f"slack post failed: {e}", file=sys.stderr)
+
+def write_heartbeat(svc, status, added, removed, needs_grant, detail):
+    try:
+        http("POST", f"{SUPA}/rest/v1/windsor_sync_heartbeat",
+             headers={"apikey":svc,"Authorization":f"Bearer {svc}","Content-Type":"application/json","Prefer":"return=minimal"},
+             body=[{"status":status,"added":added,"removed":removed,"needs_grant":needs_grant,"detail":detail}])
+    except Exception as e:
+        print(f"heartbeat write failed: {e}", file=sys.stderr)
 
 _RETRY=(ConnectionResetError,ConnectionError,socket.timeout,TimeoutError)
 def http(method, url, headers=None, body=None, attempts=3):
@@ -115,52 +139,68 @@ def main():
     sec=secrets()
     key=sec["windsor_keys"][args.workspace-1]
     svc=sec["supabase_svc"]
+    slack=sec.get("slack_token")
 
-    available=windsor_available(key)
-    connected=windsor_connected(key)
-    active, churned = hub_clients(svc)
-    print(f"available={len(available)} connected={len(connected)} hub_active={len(active)} hub_churned={len(churned)}")
+    try:
+        available=windsor_available(key)
+        connected=windsor_connected(key)
+        active, churned = hub_clients(svc)
+        print(f"available={len(available)} connected={len(connected)} hub_active={len(active)} hub_churned={len(churned)}")
 
-    # ADD: active, reachable, not connected
-    to_add=[]
-    needs_grant=[]
-    for acc, cname in active.items():
-        if acc in connected: continue
-        if acc in available: to_add.append((acc, cname, available[acc]))
-        else: needs_grant.append((acc, cname))
+        to_add=[]; needs_grant=[]
+        for acc, cname in active.items():
+            if acc in connected: continue
+            if acc in available: to_add.append((acc, cname, available[acc]))
+            else: needs_grant.append((acc, cname))
+        to_remove=[]
+        for acc, internal_id in connected.items():
+            if acc in active: continue
+            if acc in churned: to_remove.append((acc, churned[acc], internal_id))
 
-    # REMOVE: connected, owner churned, NO active collision
-    to_remove=[]
-    for acc, internal_id in connected.items():
-        if acc in active: continue                 # active owner → keep
-        if acc in churned:                          # churned owner, and not active → safe remove
-            to_remove.append((acc, churned[acc], internal_id))
+        print(f"\nPLAN: +{len(to_add)} add | -{len(to_remove)} remove | {len(needs_grant)} need Grant-Access")
+        for acc,c,info in to_add: print(f"  ADD     {acc:<20} {c}")
+        for acc,c,iid in to_remove: print(f"  REMOVE  {acc:<20} {c} (churned)")
+        for acc,c in needs_grant: print(f"  GRANT?  {acc:<20} {c} (not in OAuth scope)")
 
-    print(f"\nPLAN: +{len(to_add)} add | -{len(to_remove)} remove | {len(needs_grant)} need Grant-Access")
-    for acc,c,info in to_add: print(f"  ADD     {acc:<20} {c}")
-    for acc,c,iid in to_remove: print(f"  REMOVE  {acc:<20} {c} (churned)")
-    for acc,c in needs_grant: print(f"  GRANT?  {acc:<20} {c} (not in OAuth scope)")
+        if args.dry_run:
+            print("\n(dry-run; no changes)"); return 0
 
-    if args.dry_run:
-        print("\n(dry-run; no changes)"); return 0
+        done_add=done_rm=0; fails=[]
+        for acc,c,info in to_add:
+            st,resp=add_account(key, acc, info["name"] or c, info["cred"]); ok = st in (200,201)
+            print(f"  {'✅' if ok else '❌'} ADD {acc} ({c}) -> {st}")
+            done_add += ok;  (None if ok else fails.append(f"add {c}"))
+            time.sleep(0.4)
+        for acc,c,iid in to_remove:
+            st,resp=remove_account(key, iid); ok = st in (200,204)
+            print(f"  {'✅' if ok else '❌'} REMOVE {acc} ({c}) -> {st}")
+            done_rm += ok; (None if ok else fails.append(f"remove {c}"))
+            time.sleep(0.4)
+        print(f"\nDONE: added {done_add}/{len(to_add)}, removed {done_rm}/{len(to_remove)}")
 
-    done_add=done_rm=0
-    for acc,c,info in to_add:
-        st,resp=add_account(key, acc, info["name"] or c, info["cred"])
-        ok = st in (200,201)
-        print(f"  {'✅' if ok else '❌'} ADD {acc} ({c}) -> {st}")
-        done_add += ok
-        time.sleep(0.4)
-    for acc,c,iid in to_remove:
-        st,resp=remove_account(key, iid)
-        ok = st in (200,204)
-        print(f"  {'✅' if ok else '❌'} REMOVE {acc} ({c}) -> {st}")
-        done_rm += ok
-        time.sleep(0.4)
-    print(f"\nDONE: added {done_add}/{len(to_add)}, removed {done_rm}/{len(to_remove)}")
-    if needs_grant:
-        print(f"⚠️  {len(needs_grant)} still need manual Grant Facebook Ads Access in Windsor (new BMs).")
-    return 0
+        status = "ok" if not fails else "error"
+        grant_names = ", ".join(c for _,c in needs_grant) or "none"
+        # heartbeat (cloud reads this to detect when sync didn't run)
+        write_heartbeat(svc, status, done_add, done_rm, len(needs_grant),
+                        f"adds_failed_removes_failed={fails}; needs_grant={grant_names}")
+        # Slack — only post something noteworthy OR confirm clean reconcile
+        emoji = "✅" if not fails else "⚠️"
+        changed = (done_add or done_rm)
+        if changed or needs_grant or fails:
+            lines=[f"{emoji} *Windsor SYNC* — +{done_add} added, -{done_rm} removed"]
+            if needs_grant: lines.append(f"   🔑 {len(needs_grant)} need manual Grant Facebook Ads Access: {grant_names}")
+            if fails: lines.append(f"   ❌ failures: {', '.join(fails)}")
+            slack_post(slack, "\n".join(lines))
+        else:
+            slack_post(slack, "✅ *Windsor SYNC* — connections already match the Hub (no changes).")
+        if needs_grant:
+            print(f"⚠️  {len(needs_grant)} still need manual Grant Facebook Ads Access.")
+        return 0
+    except Exception as e:
+        print(f"SYNC FAILED: {e}", file=sys.stderr)
+        write_heartbeat(svc, "error", 0, 0, 0, f"exception: {e}")
+        slack_post(slack, f"❌ *Windsor SYNC failed* — {str(e)[:300]}")
+        return 1
 
 if __name__=="__main__":
     sys.exit(main())
